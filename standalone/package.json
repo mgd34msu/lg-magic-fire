@@ -1,0 +1,10 @@
+{
+  "name": "lg-magic-fire",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LG Magic Remote pointer, buttons and microphone bridge for Fire TV through rooted webOS",
+  "license": "MIT",
+  "scripts": {"test": "node ../tests/pointer.test.js && node ../tests/router.test.js && node ../tests/settings.test.js && node ../tests/cursor.test.js"},
+  "engines": {"node": ">=8.12.0"},
+  "dependencies": {"ws": "7.5.14"}
+}

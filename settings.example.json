@@ -1,0 +1,8 @@
+{
+  "tv_host": "192.168.1.50",
+  "fire_tv_host": "192.168.1.51",
+  "hdmi_input": 3,
+  "pointer_gain": 0.6,
+  "adb_port": 5555,
+  "cursor_idle_seconds": 5
+}

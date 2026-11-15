@@ -1,0 +1,14 @@
+.state/
+.venv/
+__pycache__/
+*.pyc
+build/
+node_modules/
+/research/
+/android/
+settings.json
+config.json
+adbkey*
+*.log
+*.tar
+*.tar.gz
