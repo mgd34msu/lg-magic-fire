@@ -46,7 +46,7 @@ def main():
         return item
 
     with tarfile.open(fileobj=buffer, mode='w') as archive:
-        for name in ('bridge.js', 'adb.js', 'hid_mouse.js', 'input_router.js', 'cursor_idle.js', 'settings.js', 'service.sh', 'package.json',
+        for name in ('bridge.js', 'adb.js', 'hid_mouse.js', 'input_router.js', 'cursor_idle.js', 'scope.js', 'settings.js', 'service.sh', 'package.json',
                      'package-lock.json', 'node_modules'):
             archive.add(ROOT / 'standalone' / name, arcname=name, filter=metadata)
         for name in ('tv_agent.py', 'tv_reader.py', 'tv_control.py', 'pointer_source.py', 'bridge_settings.py', 'install_hooks.py'):

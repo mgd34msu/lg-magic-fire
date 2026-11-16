@@ -34,6 +34,8 @@ class AdbShell {
 
   open() {
     return new Promise((resolve, reject) => {
+      if (this.options.allowed && !this.options.allowed())
+        return reject(new Error('ADB scope ended'));
       let signed = false;
       let publicSent = false;
       const pem = fs.readFileSync(this.options.key);
@@ -44,18 +46,27 @@ class AdbShell {
         if (this.closed) return;
         this.closed = true;
         clearTimeout(timer);
+        this.pending = Buffer.alloc(0);
         socket.destroy();
         reject(error);
         if (this.ready && this.onError) this.onError(error);
       };
       const timer = setTimeout(() => this.fail(new Error('ADB authorization/connect timed out')), 60000);
-      socket.on('connect', () => this.send('CNXN', 0x01000000, 4096, Buffer.from('host::\0')));
+      this.cancelOpen = () => {
+        clearTimeout(timer);
+        reject(new Error('ADB connection cancelled'));
+      };
+      socket.on('connect', () => {
+        try { this.send('CNXN', 0x01000000, 4096, Buffer.from('host::\0')); }
+        catch (error) { this.fail(error); }
+      });
       socket.on('error', error => this.fail(new Error('ADB socket: ' + error.code)));
       socket.on('close', () => {
         if (!this.closed) this.fail(new Error('ADB shell closed'));
       });
       socket.on('data', data => {
         try {
+          if (this.options.allowed && !this.options.allowed()) throw new Error('ADB scope ended');
           this.buffer = Buffer.concat([this.buffer, data]);
           while (this.buffer.length >= 24) {
             const head = this.buffer;
@@ -113,6 +124,7 @@ class AdbShell {
   }
 
   send(command, arg0, arg1, body) {
+    if (this.options.allowed && !this.options.allowed()) throw new Error('ADB scope ended');
     this.socket.write(packet(command, arg0, arg1, body));
   }
 
@@ -126,6 +138,7 @@ class AdbShell {
 
   flush() {
     if (!this.ready || this.inflight || !this.pending.length || this.closed) return;
+    if (this.options.allowed && !this.options.allowed()) return this.fail(new Error('ADB scope ended'));
     const data = this.pending.slice(0, 4096);
     this.pending = this.pending.slice(data.length);
     this.inflight = true;
@@ -135,9 +148,14 @@ class AdbShell {
   close() {
     if (this.closed) return;
     this.closed = true;
-    if (this.remote) this.send('CLSE', 1, this.remote);
+    if (this.cancelOpen) this.cancelOpen();
+    this.pending = Buffer.alloc(0);
+    if (!this.socket) return;
+    if (this.remote && (!this.options.allowed || this.options.allowed())) this.send('CLSE', 1, this.remote);
     this.socket.end();
     this.socket.destroy();
+    // Also settle callers waiting for command output after open() completed.
+    if (this.ready && this.onError) this.onError(new Error('ADB shell closed'));
   }
 }
 

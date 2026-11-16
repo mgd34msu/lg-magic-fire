@@ -38,7 +38,7 @@ Forwarding requires all of the following:
 - The corresponding physical HDMI input is active.
 - No LG foreground menu or overlay owns the controls.
 
-Opening LG Home, the input picker, or another LG menu releases captured devices so that navigation goes to LG. Leaving the configured input also releases held Fire TV navigation and mouse buttons. Volume changes remain relative to physical button presses and do not switch inputs.
+Opening LG Home, the input picker, or another LG menu releases captured devices so that navigation goes to LG. Leaving the configured input also closes Fire TV connections and removes the bridge mouse, releasing its buttons. Volume changes remain relative to physical button presses and do not switch inputs.
 
 The cursor hides after **five seconds without pointer activity** by default. Movement, wheel input, or a mouse click shows it again. D-pad navigation does not extend this timer, and hiding the cursor does not disconnect the remote.
 
@@ -62,7 +62,7 @@ The bridge uses undocumented LG services and Fire TV LAN protocols, which may ch
 
 | Port | Purpose |
 | --- | --- |
-| `8009` | Activates the Fire TV LAN remote service |
+| `8009` | Activates the Fire TV LAN remote service during explicit pairing only |
 | `8080` | Pairing, remote commands, status, and voice session control over HTTPS |
 | `9090` | Microphone audio over a secure WebSocket |
 | `5555` by default | ADB mouse reports, cursor helper, and deployment; configurable with `adb_port` |
@@ -163,7 +163,7 @@ python3 magic_fire.py status
 python3 magic_fire.py logs --lines 50
 ```
 
-A successful bridge startup logs `Magic Fire started: established Fire TV mouse`. Entering the configured input logs `Fire TV cursor active on HDMI` followed by the input number. A running supervisor alone does not confirm that Fire TV connections and input capture are ready.
+The listener starts with `Magic Fire listening; waiting for remote activity on an awake HDMI` followed by the input number. The first physical remote activity on that input opens Fire TV connections; readiness then logs `Fire TV cursor active on HDMI`. A running supervisor alone does not confirm that Fire TV connections and input capture are ready.
 
 ### 6. Enable startup at TV boot
 
@@ -282,7 +282,7 @@ Additional global options for `magic_fire.py` are `--tv HOST`, which overrides t
 | `/data/local/tmp/lg-magic-fire-cursor.jar` on Fire TV | Cursor visibility helper copied during deployment |
 | `.state/` on the computer | Private LAN pairing credentials and dedicated bridge ADB key pair |
 
-The supervisor retries an exited bridge after five seconds. Stopping the service releases input capture and restores the LG voice handler. An independent voice guardian also restores LG voice if its parent dies or stops renewing its lease.
+The supervisor retries an exited bridge after five seconds. Startup and retries only listen to LG state: they do not launch the Fire TV remote service or open Fire TV connections. A session opens on physical remote activity while the TV reports an active power state and the configured input is selected. Standby, another input, an LG menu, or a stale state heartbeat cancels pending work and closes Fire TV connections. Connection failures leave the LG listener running; later physical input can retry after a five-second cooldown. Stopping the service releases input capture and restores the LG voice handler. An independent voice guardian also restores LG voice if its parent dies or stops renewing its lease.
 
 ### Updating an installation
 
@@ -307,7 +307,7 @@ Start with `python3 magic_fire.py logs --lines 100`. The error text usually iden
 | `Missing deployment input` | Run `npm ci --prefix standalone --ignore-scripts` and `magic_fire.py setup`; confirm the checked-in cursor JAR is present. |
 | Deployment reports missing `.state/firetv.json` | Run `magic_fire.py setup` before deployment. |
 | Credentials belong to another Fire TV | Correct `fire_tv_host`, then run `magic_fire.py setup --pair`. |
-| `DIAL HTTP`, `DIAL timed out`, or Fire TV HTTP errors | Verify Fire TV is reachable and the LAN remote service ports are accessible. Re-pair if the saved token is no longer accepted. |
+| Pairing activation errors or Fire TV HTTP errors | Verify Fire TV is reachable and the LAN remote service ports are accessible. Explicitly run `magic_fire.py setup --pair` if the LAN service needs activation or its token is no longer accepted. Runtime retries never launch it automatically because that can trigger HDMI-CEC input switching and TV wake-ups. |
 | ADB `unauthorized`, `Waiting for Fire TV to authorize the TV bridge key`, or authorization timeout | Accept the appropriate key on Fire TV. The installation computer and TV bridge use different keys. Check `adb_port` and ADB debugging. |
 | `Fire TV mouse did not register` | Check ADB connectivity, `/system/bin/hid`, and firmware compatibility. |
 | `Cursor visibility helper did not start` | Check the deployed cursor JAR, `app_process`, and Android API compatibility. |
@@ -361,7 +361,7 @@ Deployment installs no new `lginputhook` mappings. `install_hooks.py` is a migra
 
 The runtime has three main parts:
 
-1. **LG input reader:** Python reads the remote's evdev devices and checks the foreground LG application, overlays, and physical input through Luna services. It captures devices only within the configured HDMI scope, suppressing the LG pointer while forwarding is active.
+1. **LG input reader:** Python reads the remote's evdev devices and checks the foreground LG application, overlays, and physical input through Luna services. It requires an explicit `Active` TV power state and captures devices only within the configured HDMI scope, suppressing the LG pointer while forwarding is active. Missing or unreadable power state disables forwarding.
 2. **TV bridge:** Node routes navigation and voice through Fire TV's paired LAN remote service. Its ADB client sends relative HID mouse reports directly to Android's `hid` utility, producing Fire TV's native cursor. The TV does not need an installed `adb` executable for runtime operation.
 3. **Fire TV cursor helper:** A small Java helper runs through `app_process` and changes the system mouse icon's visibility. It is separate from mouse motion and button routing.
 
@@ -375,7 +375,7 @@ Android's native cursor fade timer can be shorter than the configured timeout. T
 
 While the configured HDMI scope is active, the reader temporarily pauses LG's `voiceconductor` under a renewable guardian lease. A held microphone button opens the LG microphone stream and forwards audio to Alexa over the paired Fire TV voice connection. Release, leaving the scope, or reaching the 20-second limit ends the session. The bridge does not save microphone audio.
 
-Input descriptors are close-on-exec and released before service cleanup. Held Fire TV keys and mouse buttons are released when scope ends. The voice guardian is independent of the main process so LG voice can recover after a crash or an expired lease.
+Input descriptors are close-on-exec and released before service cleanup. On scope loss, pending HTTP requests and ADB connections are cancelled, queued input from the old scope is discarded, and mouse removal releases its buttons. Cleanup does not inject mouse motion or remote commands after the TV has been turned off or its input changed. The voice guardian is independent of the main process so LG voice can recover after a crash or an expired lease. If LG has no voice process during a power transition, pointer and button control continue rather than crashing and restarting the bridge.
 
 ## Project layout and development
 
@@ -389,6 +389,7 @@ Input descriptors are close-on-exec and released before service cleanup. Held Fi
 | `pointer_source.py` | Pointer recenter confirmation and stale-coordinate handling |
 | `standalone/bridge.js` | Fire TV LAN remote and voice orchestration |
 | `standalone/adb.js` / `standalone/hid_mouse.js` | ADB wire protocol and relative HID mouse reports |
+| `standalone/scope.js` | Fresh power/input authorization, scope generations, and immediate session cancellation |
 | `standalone/input_router.js` / `standalone/cursor_idle.js` | Fire TV event routing and cursor idle timing |
 | `standalone/service.sh` | TV supervisor and service lifecycle |
 | `cursor/` | Java cursor helper source, build script, and prebuilt JAR |
@@ -403,7 +404,7 @@ npm test --prefix standalone
 node --check standalone/bridge.js
 ```
 
-Tests use mocks and fixtures without device connections. They cover HDMI selection, native LG routing, capture cleanup, pointer scaling/recentering, settings, and idle visibility. They do not establish compatibility with every device or app, or validate live ADB, microphone streaming, and firmware services.
+Tests use mocks and fixtures without device connections. They cover HDMI selection, power-state gating, native LG routing, capture cleanup, pointer scaling/recentering, settings, idle visibility, startup without Fire TV traffic, and cancellation of pending connections and stale queued input. They do not establish compatibility with every device or app, or validate live ADB, microphone streaming, and firmware services.
 
 Keep runtime JavaScript compatible with Node 8.12 and TV Python compatible with Python 2.7. Installation tools use Python 3.9+ and modern Node/npm. See [CONTRIBUTING.md](CONTRIBUTING.md) for regression coverage and hardware reporting expectations.
 

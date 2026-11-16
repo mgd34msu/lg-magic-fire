@@ -1,4 +1,6 @@
 import unittest
+from unittest.mock import patch
+from tv_agent import pause_assistant
 from tv_control import CaptureLease, NativeButtons, FIRE_KEYS
 
 
@@ -13,6 +15,12 @@ class NativeControlTests(unittest.TestCase):
     def test_home_preserves_original_action_and_releases_first(self):
         self.native.handle(773, 1)
         self.assertEqual(self.calls, ['release', 'original-home'])
+
+    def test_missing_voice_process_can_leave_pointer_and_buttons_running(self):
+        with patch('tv_agent.glob.glob', return_value=[]):
+            self.assertIsNone(pause_assistant(0, required=False))
+            with self.assertRaises(RuntimeError):
+                pause_assistant(0)
 
     def test_input_releases_before_opening_lg_picker(self):
         self.native.handle(241, 1)

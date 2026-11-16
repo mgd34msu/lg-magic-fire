@@ -3,7 +3,6 @@
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
-const http = require('http');
 const cp = require('child_process');
 const readline = require('readline');
 const crypto = require('crypto');
@@ -13,6 +12,7 @@ const Mouse = require('./hid_mouse').Mouse;
 const InputRouter = require('./input_router').InputRouter;
 const CursorIdle = require('./cursor_idle').CursorIdle;
 const settingsLoader = require('./settings');
+const Scope = require('./scope').Scope;
 const directory = __dirname;
 const settingsPath = path.resolve(process.env.MAGIC_FIRE_SETTINGS || path.join(directory, 'settings.json'));
 const settings = settingsLoader.loadSettings(settingsPath);
@@ -24,8 +24,9 @@ const log = message => console.log(new Date().toISOString() + ' ' + message);
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 
-function request(route, data) {
+function request(session, route, data) {
   return new Promise((resolve, reject) => {
+    if (!permitted(session)) return reject(new Error('Fire TV scope ended'));
     const body = data === undefined ? null : Buffer.from(JSON.stringify(data));
     const req = https.request({
       host: config.host, port: 8080, path: route, method: body ? 'POST' : 'GET',
@@ -42,20 +43,23 @@ function request(route, data) {
       });
       res.on('error', reject);
       res.on('end', () => {
+        if (!permitted(session)) return reject(new Error('Fire TV scope ended'));
         if (res.statusCode < 200 || res.statusCode >= 300)
           return reject(new Error('Fire TV HTTP ' + res.statusCode));
         resolve(Buffer.concat(chunks).toString('utf8'));
       });
     });
     const timer = setTimeout(() => req.destroy(new Error('Fire TV request timed out')), 5000);
-    req.on('close', () => clearTimeout(timer));
+    session.requests.add(req);
+    req.on('close', () => { clearTimeout(timer); session.requests.delete(req); });
     req.on('error', reject);
     req.end(body);
   });
 }
 
 class Voice {
-  constructor() {
+  constructor(session) {
+    this.session = session;
     this.socket = null;
     this.owned = false;
     this.bytes = 0;
@@ -64,7 +68,8 @@ class Voice {
   async start() {
     if (this.owned) await this.stop();
     try {
-      await request('/v1/FireTV/voiceCommand?action=start', {});
+      await request(this.session, '/v1/FireTV/voiceCommand?action=start', {});
+      if (!permitted(this.session)) throw new Error('Fire TV scope ended');
       this.owned = true;
       const socket = this.socket = new WebSocket('wss://' + config.host + ':9090/', {
         rejectUnauthorized: false, perMessageDeflate: false, handshakeTimeout: 5000,
@@ -84,6 +89,7 @@ class Voice {
     }
   }
   audio(data) {
+    if (!permitted(this.session)) return;
     if (!this.socket || this.socket.readyState !== WebSocket.OPEN)
       throw new Error('Alexa audio socket is not open');
     if (this.socket.bufferedAmount > 256 * 1024) throw new Error('Alexa audio backpressure limit');
@@ -95,12 +101,18 @@ class Voice {
     }
     this.pending = joined.slice(length);
   }
+  abandon() {
+    this.owned = false;
+    if (this.socket) this.socket.terminate();
+    this.socket = null;
+    this.pending = Buffer.alloc(0);
+  }
   async stop() {
     try {
-      if (this.owned) {
-        await request('/v1/FireTV/voiceCommand?action=stop', {});
-        this.owned = false;
-      }
+      const owned = this.owned;
+      this.owned = false;
+      if (owned && permitted(this.session))
+        await request(this.session, '/v1/FireTV/voiceCommand?action=stop', {});
     } finally {
       if (this.socket) {
         const socket = this.socket;
@@ -114,31 +126,53 @@ class Voice {
   }
 }
 
-let adb = null;
+let session = null;
 let agent = null;
 let exiting = false;
 let queue = Promise.resolve();
 let count = 0;
-const voice = new Voice();
-let mouse = null;
-let router = null;
-let cursorShell = null;
-let cursorTimer = null;
+let retryAt = 0;
+const devices = {};
+const scope = new Scope(expectedApp, disposeSession);
 
-async function fireKey(key, value) {
+function permitted(candidate) {
+  return !exiting && candidate === session && scope.valid(candidate.generation);
+}
+
+function disposeSession() {
+  const previous = session;
+  session = null;
+  if (!previous) return;
+  // Disconnect instead of injecting cleanup input after the user has left or
+  // powered off. Closing hid removes its mouse, including any held buttons.
+  previous.voice.abandon();
+  previous.requests.forEach(req => req.destroy(new Error('Fire TV scope ended')));
+  previous.shells.forEach(shell => shell.close());
+  log('LG controls restored; Fire TV connections closed');
+}
+
+async function fireKey(candidate, key, value) {
+  if (!permitted(candidate)) return;
   if (key === 'playPause') {
-    if (value === 1) await request('/v1/media?action=play', {});
+    if (value === 1) await request(candidate, '/v1/media?action=play', {});
   } else if (key === 'back') {
-    if (value === 1) await request('/v1/FireTV?action=back', {});
+    if (value === 1) await request(candidate, '/v1/FireTV?action=back', {});
   } else {
-    await request('/v1/FireTV?action=' + key,
+    await request(candidate, '/v1/FireTV?action=' + key,
       {keyActionType: value === 1 ? 'keyDown' : 'keyUp'});
   }
 }
 
-async function shellCommand(command) {
-  const shell = new AdbShell({host: config.host, port: config.adb_port, key: path.join(directory, 'adbkey'),
-    command: command + '; magic_fire_rc=$?; echo MAGIC_FIRE_DONE:$magic_fire_rc'});
+function newShell(candidate, command) {
+  if (!permitted(candidate)) throw new Error('Fire TV scope ended');
+  const shell = new AdbShell({host: config.host, port: config.adb_port,
+    key: path.join(directory, 'adbkey'), command, allowed: () => permitted(candidate)});
+  candidate.shells.add(shell);
+  return shell;
+}
+
+async function shellCommand(candidate, command) {
+  const shell = newShell(candidate, command + '; magic_fire_rc=$?; echo MAGIC_FIRE_DONE:$magic_fire_rc');
   let timer;
   const completed = new Promise((resolve, reject) => {
     shell.onError = error => {
@@ -149,102 +183,118 @@ async function shellCommand(command) {
   });
   try {
     const results = await Promise.all([shell.open(), completed]);
+    if (!permitted(candidate)) throw new Error('Fire TV scope ended');
     return results[1];
   } finally {
     clearTimeout(timer);
     shell.close();
+    candidate.shells.delete(shell);
   }
 }
 
-async function event(e) {
-  if (e.kind === 'voice-start') {
-    if (router.active) await voice.start();
-    return;
+async function initialize(candidate) {
+  // Never POST /apps/FireTVRemote here. DIAL launch can assert HDMI-CEC active
+  // source and power on the TV. Pairing is the explicit service activation step.
+  await request(candidate, '/v1/FireTV/status');
+  const adb = newShell(candidate, 'hid -');
+  await adb.open();
+  adb.onError = error => failed(candidate, error);
+  const mouse = candidate.mouse = new Mouse(data => {
+    if (!permitted(candidate)) throw new Error('Fire TV scope ended');
+    adb.write(data);
+  }, config.gain);
+  mouse.register();
+  const readyUntil = scope.now() + 6000;
+  let registered = false;
+  while (scope.now() < readyUntil) {
+    const info = await shellCommand(candidate, 'dumpsys input');
+    if (info.indexOf('Magic Fire Mouse') !== -1) { registered = true; break; }
+    await sleep(200);
   }
-  if (e.kind === 'voice-audio') {
-    if (router.active && voice.owned) voice.audio(Buffer.from(e.pcm, 'base64'));
-    return;
+  if (!registered) throw new Error('Fire TV mouse did not register');
+  const cursorShell = newShell(candidate,
+    'CLASSPATH=/data/local/tmp/lg-magic-fire-cursor.jar app_process /system/bin PointerVisibility');
+  await cursorShell.open();
+  cursorShell.onError = error => failed(candidate, error);
+  const cursorDeadline = scope.now() + 6000;
+  while (cursorShell.output.indexOf('CURSOR_READY') === -1) {
+    if (!permitted(candidate)) throw new Error('Fire TV scope ended');
+    if (cursorShell.closed || scope.now() > cursorDeadline) throw new Error('Cursor visibility helper did not start');
+    await sleep(50);
   }
-  if (e.kind === 'voice-end') {
-    await voice.stop();
-    log('Alexa session ended (' + e.reason + ')');
-    return;
+  if (!permitted(candidate)) throw new Error('Fire TV scope ended');
+  cursorShell.write('hide\n');
+  candidate.cursor = new CursorIdle(settings.cursor_idle_seconds,
+    visible => cursorShell.write(visible ? 'show\n' : 'hide\n'), () => mouse.keepAlive());
+  const router = candidate.router = new InputRouter(mouse,
+    (key, value) => fireKey(candidate, key, value),
+    code => shellCommand(candidate, 'input keyevent ' + code), expectedApp, candidate.cursor);
+  for (const device of Object.keys(devices)) await router.handle(devices[device]);
+  if (!permitted(candidate)) throw new Error('Fire TV scope ended');
+  await router.handle({kind: 'foreground', app: expectedApp, active: true});
+  log('Fire TV cursor active on HDMI ' + settings.hdmi_input + ', gain ' + config.gain);
+}
+
+function failed(candidate, error) {
+  if (candidate !== session) return;
+  log('Fire TV session: ' + error.message);
+  retryAt = scope.now() + 5000;
+  disposeSession();
+}
+
+async function event(e, generation) {
+  // No connection on startup, foreground polling, or pointer reset. Only a
+  // physical event while the TV is awake on the selected input opens a session.
+  if (!scope.valid(generation) || e.kind === 'foreground') return;
+  if (!session) {
+    if (scope.now() < retryAt || (e.kind !== 'event' && e.kind !== 'voice-start')) return;
+    if (e.kind === 'event' && e.active !== true) return;
+    session = {generation, requests: new Set(), shells: new Set()};
+    session.voice = new Voice(session);
+    session.ready = initialize(session);
   }
-  const previous = router.active;
-  await router.handle(e);
-  if (previous !== router.active) {
-    if (!router.active) await voice.stop();
-    log(router.active ? 'Fire TV cursor active on HDMI ' + settings.hdmi_input : 'LG controls restored; Fire TV forwarding paused');
+  const candidate = session;
+  try {
+    await candidate.ready;
+    if (!permitted(candidate) || candidate.generation !== generation) return;
+    if (e.kind === 'voice-start') {
+      await candidate.voice.start();
+    } else if (e.kind === 'voice-audio') {
+      if (candidate.voice.owned) candidate.voice.audio(Buffer.from(e.pcm, 'base64'));
+    } else if (e.kind === 'voice-end') {
+      await candidate.voice.stop();
+      log('Alexa session ended (' + e.reason + ')');
+    } else {
+      await candidate.router.handle(e);
+    }
+  } catch (error) {
+    failed(candidate, error);
   }
 }
+
+const cursorTimer = setInterval(() => {
+  scope.tick();
+  if (session && permitted(session) && session.cursor) {
+    try { session.cursor.tick(); } catch (error) { failed(session, error); }
+  }
+}, 100);
 
 async function shutdown(error) {
   if (exiting) return;
   exiting = true;
   clearInterval(cursorTimer);
   if (error) log('Stopping: ' + error.message);
-  // Restore TV control first, independently of Fire TV availability.
+  scope.revoke();
+  disposeSession();
   if (agent) {
     agent.kill('SIGTERM');
     await Promise.race([new Promise(resolve => agent.once('exit', resolve)), sleep(1500)]);
   }
-  if (router) {
-    try { await router.handle({kind: 'foreground', app: null, active: false}); } catch (_) {}
-  }
-  try { await voice.stop(); } catch (_) {}
-  if (cursorShell) {
-    try { cursorShell.write('show\n'); await sleep(100); } catch (_) {}
-    cursorShell.close();
-  }
-  if (adb) adb.close();
   process.exit(error ? 1 : 0);
 }
 
-async function start() {
-  // Activate the LAN remote service explicitly once per bridge start.
-  await new Promise((resolve, reject) => {
-    const req = http.request({host: config.host, port: 8009, path: '/apps/FireTVRemote', method: 'POST'}, res => {
-      res.resume();
-      res.on('end', () => res.statusCode === 201 ? resolve() : reject(new Error('DIAL HTTP ' + res.statusCode)));
-    });
-    req.setTimeout(5000, () => req.destroy(new Error('DIAL timed out')));
-    req.on('error', reject);
-    req.end();
-  });
-  await sleep(500);
-  await request('/v1/FireTV/status');
-  const gain = config.gain === undefined ? .6 : config.gain;
-  if (!Number.isFinite(gain) || gain < .1 || gain > 2) throw new Error('Invalid pointer gain');
-  adb = new AdbShell({host: config.host, port: config.adb_port, key: path.join(directory, 'adbkey'), command: 'hid -'});
-  await adb.open();
-  adb.onError = error => shutdown(error);
-  mouse = new Mouse(data => adb.write(data), gain);
-  mouse.register();
-  const readyUntil = Date.now() + 6000;
-  let registered = false;
-  while (Date.now() < readyUntil) {
-    const devices = await shellCommand('dumpsys input');
-    if (devices.indexOf('Magic Fire Mouse') !== -1) { registered = true; break; }
-    await sleep(200);
-  }
-  if (!registered) throw new Error('Fire TV mouse did not register');
-  cursorShell = new AdbShell({host: config.host, port: config.adb_port,
-    key: path.join(directory, 'adbkey'),
-    command: 'CLASSPATH=/data/local/tmp/lg-magic-fire-cursor.jar app_process /system/bin PointerVisibility'});
-  await cursorShell.open();
-  cursorShell.onError = error => shutdown(error);
-  const cursorDeadline = Date.now() + 6000;
-  while (cursorShell.output.indexOf('CURSOR_READY') === -1) {
-    if (cursorShell.closed || Date.now() > cursorDeadline) throw new Error('Cursor visibility helper did not start');
-    await sleep(50);
-  }
-  cursorShell.write('hide\n');
-  const cursor = new CursorIdle(settings.cursor_idle_seconds,
-    visible => cursorShell.write(visible ? 'show\n' : 'hide\n'), () => mouse.keepAlive());
-  cursorTimer = setInterval(() => {
-    try { cursor.tick(); } catch (error) { shutdown(error); }
-  }, 100);
-  router = new InputRouter(mouse, fireKey, code => shellCommand('input keyevent ' + code), expectedApp, cursor);
+function start() {
+  // Observe LG first. Fire TV must remain untouched while this process waits.
   agent = cp.spawn('python', ['-B', '-u', path.join(directory, 'tv_agent.py'), 'bridge', '0',
     crypto.randomBytes(16).toString('hex')], {stdio: ['ignore', 'pipe', 'inherit'],
       env: Object.assign({}, process.env, {MAGIC_FIRE_SETTINGS: settingsPath})});
@@ -253,16 +303,28 @@ async function start() {
   const lines = readline.createInterface({input: agent.stdout});
   lines.on('line', line => {
     if (exiting) return;
-    count++;
-    if (count > 10000) return shutdown(new Error('Input processing backlog'));
-    queue = queue.then(() => event(JSON.parse(line))).then(() => { count--; })
-      .catch(error => shutdown(error));
+    try {
+      const e = JSON.parse(line);
+      scope.observe(e); // Immediately cancels in-flight initialization and input.
+      if (e.kind === 'device') devices[e.device] = e;
+      if (e.kind === 'pointer-reset' && devices[e.device]) {
+        devices[e.device].axes = {0: [e.x], 1: [e.y]};
+      }
+      const generation = scope.generation;
+      count++;
+      if (count > 10000) return shutdown(new Error('Input processing backlog'));
+      queue = queue.then(() => event(e, generation)).then(() => { count--; })
+        .catch(error => shutdown(error));
+    } catch (error) {
+      shutdown(error);
+    }
   });
-  log('Magic Fire started: established Fire TV mouse, gain ' + gain);
+  lines.on('close', () => scope.revoke());
+  log('Magic Fire listening; waiting for remote activity on an awake HDMI ' + settings.hdmi_input);
 }
 
 process.on('SIGTERM', () => shutdown());
 process.on('SIGINT', () => shutdown());
 process.on('uncaughtException', error => shutdown(error));
 process.on('unhandledRejection', error => shutdown(error));
-start().catch(error => shutdown(error));
+start();

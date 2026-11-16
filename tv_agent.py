@@ -53,6 +53,11 @@ def luna(uri, payload, timeout=3):
 
 def foreground(settings=None):
     settings = settings or load_settings()
+    # webOS can keep reporting the last HDMI app while the panel is off.
+    # Unknown/missing power state must never authorize Fire TV traffic.
+    power = luna('com.webos.service.tvpower/power/getPowerState', {})
+    if power.get('returnValue') is not True or power.get('state') != 'Active':
+        return 'LG-power:' + str(power.get('state', 'unknown'))
     expected_app = target_app(settings)
     app = luna('com.webos.applicationManager/getForegroundAppInfo', {}).get('appId')
     if app == expected_app:
@@ -100,7 +105,7 @@ def guard(pid, seconds):
                 pass
 
 
-def pause_assistant(seconds):
+def pause_assistant(seconds, required=True):
     for path in glob.glob('/proc/[0-9]*/comm'):
         try:
             with open(path) as f:
@@ -118,7 +123,9 @@ def pause_assistant(seconds):
                 return p
         except (IOError, OSError):
             continue
-    raise RuntimeError('LG voiceconductor was not found')
+    if required:
+        raise RuntimeError('LG voiceconductor was not found')
+    return None
 
 
 class Microphone(object):

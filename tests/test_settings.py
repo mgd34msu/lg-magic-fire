@@ -12,7 +12,7 @@ class SettingsTests(unittest.TestCase):
         for number in range(1, 5):
             settings = self.settings(hdmi_input=number)
             app = target_app(settings)
-            replies = [{'appId': app}, {'currentState': 'none'}, {'windows': [{'appId': app}]},
+            replies = [{'returnValue': True, 'state': 'Active'}, {'appId': app}, {'currentState': 'none'}, {'windows': [{'appId': app}]},
                        {'devices': [{'id': target_input(settings), 'activate': True}]}]
             with patch('tv_agent.luna', side_effect=replies):
                 self.assertEqual(foreground(settings), app)
@@ -30,9 +30,25 @@ class SettingsTests(unittest.TestCase):
 
     def test_lg_overlay_releases_scope(self):
         settings = self.settings(hdmi_input=2)
-        with patch('tv_agent.luna', side_effect=[{'appId': target_app(settings)},
+        with patch('tv_agent.luna', side_effect=[{'returnValue': True, 'state': 'Active'}, {'appId': target_app(settings)},
                                                 {'currentState': 'settings'}]):
             self.assertEqual(foreground(settings), 'LG-UI:settings')
+
+    def test_power_off_and_unknown_state_never_authorize_last_hdmi_app(self):
+        settings = self.settings()
+        for reply in ({'returnValue': True, 'state': 'Active Standby'},
+                      {'returnValue': True, 'state': 'Screen Off'},
+                      {'returnValue': True, 'state': 'Suspend'},
+                      {'returnValue': False, 'state': 'Active'}, {},
+                      {'returnValue': True}):
+            with self.subTest(reply=reply), patch('tv_agent.luna', return_value=reply) as query:
+                self.assertTrue(foreground(settings).startswith('LG-power:'))
+                query.assert_called_once_with('com.webos.service.tvpower/power/getPowerState', {})
+
+    def test_missing_power_service_fails_closed(self):
+        with patch('tv_agent.luna', side_effect=RuntimeError('Power service unavailable')):
+            with self.assertRaises(RuntimeError):
+                foreground(self.settings())
 
 
 if __name__ == '__main__':

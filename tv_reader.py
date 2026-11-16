@@ -133,7 +133,9 @@ def capture(seconds, bridge=False):
                     if bridge:
                         lease.acquire()
                         try:
-                            state['guardian'] = pause_assistant(0)
+                            # Some power transitions leave voiceconductor absent.
+                            # Pointer/buttons must not enter a restart loop for it.
+                            state['guardian'] = pause_assistant(0, required=False)
                         except Exception:
                             lease.release()
                             raise
@@ -208,6 +210,8 @@ def capture(seconds, bridge=False):
                     if bridge and state['active'] and typ == 1 and code == 428:
                         if value == 1 and not mic.sock:
                             try:
+                                if state['guardian'] is None:
+                                    state['guardian'] = pause_assistant(0, required=False)
                                 emit(kind='voice-start')
                                 mic.open()
                             except Exception as error:
